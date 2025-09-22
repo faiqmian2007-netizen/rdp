@@ -29,6 +29,7 @@ jobs:
           Restart-Service -Name TermService -Force
 
       - name: Create or Reset RDP User (use secret for password)
+        id: reset_user
         shell: pwsh
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}         # set this secret in repo/settings
@@ -43,9 +44,11 @@ jobs:
 
           # If user exists, reset password; otherwise create
           if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+            Write-Host "Resetting password for existing user 'RDP'..."
             Set-LocalUser -Name "RDP" -Password $securePass
             Enable-LocalUser -Name "RDP"
           } else {
+            Write-Host "Creating user 'RDP'..."
             New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
           }
 
@@ -53,9 +56,55 @@ jobs:
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
 
-          # Export username (but NOT the password) to GITHUB_ENV for downstream steps
+          # Ensure RDP allows password auth (disable NLA for debugging; change if you want NLA)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+          Restart-Service -Name TermService -Force
+
+          # Export username only (do NOT export password to logs)
           Add-Content -Path $env:GITHUB_ENV -Value "RDP_USERNAME=RDP"
           Add-Content -Path $env:GITHUB_ENV -Value "RDP_CREDS=User: RDP | Password: (stored in secret)"
+
+      - name: Verify local credential works (no password printed)
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          # This tries to start a simple process as the RDP user using the secret.
+          # It WILL NOT print the password. Success means the password is applied correctly.
+          $user = "RDP"
+          $pw = $env:RDP_PASSWORD
+          $secure = ConvertTo-SecureString $pw -AsPlainText -Force
+          $cred = New-Object System.Management.Automation.PSCredential ("$env:COMPUTERNAME\$user", $secure)
+
+          try {
+            # Try to run whoami as that credential. -NoNewWindow may fail in Actions; use Start-Process and -Wait
+            $proc = Start-Process -FilePath "$env:windir\System32\whoami.exe" -ArgumentList "" -Credential $cred -PassThru -WindowStyle Hidden -ErrorAction Stop
+            $proc.WaitForExit()
+            $out = (Get-Content -Path "$env:windir\Temp\whoami_output.txt" -ErrorAction SilentlyContinue) -join "`n"
+            Write-Host "Credential test succeeded (Start-Process as RDP succeeded)."
+            Write-Output "CREDENTIAL_TEST=success" >> $env:GITHUB_ENV
+          } catch {
+            Write-Host "Credential test FAILED. Error: $($_.Exception.Message)"
+            Write-Output "CREDENTIAL_TEST=failed" >> $env:GITHUB_ENV
+            # Fall through to event log tailing for diagnostics
+          }
+
+          # If failed, show recent failed logons (4625) to help debugging (no sensitive data printed)
+          if ($env:CREDENTIAL_TEST -ne 'success') {
+            Write-Host "`nRecent failed logon events (up to 10):"
+            $events = Get-WinEvent -FilterHashtable @{LogName='Security'; ID=4625} -MaxEvents 10 -ErrorAction SilentlyContinue
+            if ($events) {
+              $events | ForEach-Object {
+                $time = $_.TimeCreated
+                $props = $_.Properties
+                # Properties indices vary; print only time and raw message snippet without exposing secrets
+                Write-Host " - $time  | Message: $($_.Message.Split([Environment]::NewLine)[0])"
+              }
+            } else {
+              Write-Host "No 4625 failed-logon events found."
+            }
+          }
 
       - name: Install Tailscale
         shell: pwsh
@@ -133,6 +182,7 @@ jobs:
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           Write-Host "Username: $env:RDP_USERNAME"
           Write-Host "Password: (stored in repository secret RDP_PASSWORD)"
+          Write-Host "Credential test result: $env:CREDENTIAL_TEST"
           Write-Host "==============================================`n"
 
       # Optional: keep job alive for manual testing (comment out if not needed)
